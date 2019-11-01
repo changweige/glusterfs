@@ -1836,11 +1836,11 @@ trash_truncate_stat_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 
     table = local->loc.inode->table;
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_rdlock(&table->lock);
     {
         dir_entry = __dentry_search_arbit(local->loc.inode);
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     if (op_ret == -1) {
         gf_log(this->name, GF_LOG_DEBUG, "fstat on the file failed: %s",

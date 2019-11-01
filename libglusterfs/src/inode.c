@@ -130,10 +130,13 @@ Based on this, the code could be similar to this:
     }
 
 static inode_t *
-__inode_unref(inode_t *inode, bool clear);
+__inode_unref(inode_t *inode);
 
 static int
 inode_table_prune(inode_table_t *table);
+
+void
+__prune_inode(inode_t *inode);
 
 void
 fd_dump(struct list_head *head, char *prefix);
@@ -197,6 +200,9 @@ dentry_destroy(dentry_t *dentry)
     return;
 }
 
+/* Code path "__dentry_unset() -> inode_unref()"" causes AA deadlock.
+ * Eliminate table lock since table lock should already be acquired.
+ */
 static dentry_t *
 __dentry_unset(dentry_t *dentry)
 {
@@ -205,10 +211,20 @@ __dentry_unset(dentry_t *dentry)
 
     __dentry_unhash(dentry);
 
+    /* NOTE:
+     * We don't change inode refcount when attach or detach dentry to inode
+     */
     list_del_init(&dentry->inode_list);
 
     if (dentry->parent) {
-        __inode_unref(dentry->parent, false);
+        LOCK(&dentry->parent->ref_lock);
+        {
+            /* inode table lock should already be acquired. */
+            __inode_unref(dentry->parent);
+            if (dentry->parent->ref == 0)
+                __prune_inode(dentry->parent);
+        }
+        UNLOCK(&dentry->parent->ref_lock);
         dentry->parent = NULL;
     }
 
@@ -364,9 +380,12 @@ noctx:
 static void
 __inode_destroy(inode_t *inode)
 {
+    GF_ASSERT(inode->ref == 0 && GF_ATOMIC_GET(inode->nlookup) == 0);
+
     __inode_ctx_free(inode);
 
     LOCK_DESTROY(&inode->lock);
+    LOCK_DESTROY(&inode->ref_lock);
     //  memset (inode, 0xb, sizeof (*inode));
     mem_put(inode);
 }
@@ -406,8 +425,9 @@ inode_ctx_merge(fd_t *fd, inode_t *inode, inode_t *linked_inode)
 static void
 __inode_activate(inode_t *inode)
 {
+    /* We can't bring back an inode going to be purged! */
     list_move(&inode->list, &inode->table->active);
-    inode->table->active_size++;
+    GF_ATOMIC_INC(inode->table->active_size);
 }
 
 static void
@@ -432,6 +452,16 @@ __inode_retire(inode_t *inode)
     dentry_t *dentry = NULL;
     dentry_t *t = NULL;
 
+    /* Although brick process has nothing to do with fuse, 'nlookup' is changed.
+     * One case causing nlookup changed is 'self-heal daemon'. Below assert
+     * statement catches exceptions where nlookup is not zero but inode is being
+     * freed. So if no ::invalidator_fn is set, we ignore it *for now*. But
+     * hopefully, we can ensure that only fuse client have to use 'nlookup'.
+     * TODO: Investigate if only fuse client can change nlookup. */
+    GF_ASSERT((inode->table->invalidator_fn && inode->ref == 0 &&
+               GF_ATOMIC_GET(inode->nlookup) == 0) ||
+              (!inode->table->invalidator_fn && inode->ref == 0));
+
     list_move_tail(&inode->list, &inode->table->purge);
     inode->table->purge_size++;
 
@@ -440,6 +470,43 @@ __inode_retire(inode_t *inode)
     list_for_each_entry_safe(dentry, t, &inode->dentry_list, inode_list)
     {
         dentry_destroy(__dentry_unset(dentry));
+    }
+}
+
+/* Must be protected by inode table lock, be careful to comply locking order:
+ * inode::lock > inode_table::lock >inode::ref_lock.
+ * Please be note, only ref=0 inode can be put to lru list. Those whose nlookup
+ * is zero can be directly moved to purge list and wait for the closest chance
+ * to be freed.
+ */
+void
+__prune_inode(inode_t *inode)
+{
+    GF_ASSERT(inode->ref == 0);
+
+    /* Have to use inode table lock to protect ::in_invalidate_list */
+    if (!inode->in_invalidate_list) {
+        uint64_t nlookup = 0;
+
+        GF_ATOMIC_DEC(inode->table->active_size);
+
+        /* Only when inode ref is ZERO, 'nlookup' is checked and decides
+         * whether to directly purge it or purge it after invalidation.
+         */
+        nlookup = GF_ATOMIC_GET(inode->nlookup);
+        if (nlookup)
+            __inode_passivate(inode);
+        else
+            __inode_retire(inode);
+
+    } else {
+        /* When an inode on the 'invalidate list' whose ref is dropped to zero,
+         * we also have to move it back to lru list. In this case, this inode
+         * may or may not send invalidaition req to kernel successfully. Only
+         * move it inode managemant knows what to do next. */
+        inode->in_invalidate_list = false;
+        inode->table->invalidate_size--;
+        list_move(&inode->list, &inode->table->lru);
     }
 }
 
@@ -460,11 +527,10 @@ out:
 }
 
 static inode_t *
-__inode_unref(inode_t *inode, bool clear)
+__inode_unref(inode_t *inode)
 {
     int index = 0;
     xlator_t *this = NULL;
-    uint64_t nlookup = 0;
 
     /*
      * Root inode should always be in active list of inode table. So unrefs
@@ -510,36 +576,46 @@ __inode_unref(inode_t *inode, bool clear)
 
     this = THIS;
 
-    if (clear && inode->in_invalidate_list) {
-        inode->in_invalidate_list = false;
-        inode->table->invalidate_size--;
-        __inode_activate(inode);
-    }
     GF_ASSERT(inode->ref);
 
     --inode->ref;
 
+    /* TODO: Below is for debug purpose, loose consistency with inode ref should
+     * be acceptable! So we might have a chance to move it out from this
+     * function */
     index = __inode_get_xl_index(inode, this);
     if (index >= 0) {
         inode->_ctx[index].xl_key = this;
         inode->_ctx[index].ref--;
     }
 
-    if (!inode->ref && !inode->in_invalidate_list) {
-        inode->table->active_size--;
-
-        nlookup = GF_ATOMIC_GET(inode->nlookup);
-        if (nlookup)
-            __inode_passivate(inode);
-        else
-            __inode_retire(inode);
-    }
-
     return inode;
 }
 
+/* 'Invalidate' list only makes sense for fuse client to tracking those inodes
+ * which already have ZERO ref but still referenced by kernel. We are planning
+ * to prune them at a proper timepoint.
+ * Note: This function must be put inside WR inode table lock protection scope.
+ */
+void
+__reuse_inode(inode_t *inode)
+{
+    /* When an inode is on 'invlaidate' list, set the flag 'in_invalidate_list'.
+     * An inode whose ref is ZERO must be on *LRU* list.
+     * *REUSE* exactly means we want to bring back a ref=0 inode, it can't
+     * anywhere else but *LRU* list.
+     */
+
+    GF_ASSERT(!inode->in_invalidate_list);
+
+    inode->table->lru_size--;
+
+    __inode_activate(inode);
+}
+
+/* Using inode localized lock to protect this  */
 static inode_t *
-__inode_ref(inode_t *inode, bool is_invalidate)
+__inode_ref(inode_t *inode)
 {
     int index = 0;
     xlator_t *this = NULL;
@@ -560,22 +636,6 @@ __inode_ref(inode_t *inode, bool is_invalidate)
     if (__is_root_gfid(inode->gfid) && inode->ref)
         return inode;
 
-    if (!inode->ref) {
-        if (inode->in_invalidate_list) {
-            inode->in_invalidate_list = false;
-            inode->table->invalidate_size--;
-        } else {
-            inode->table->lru_size--;
-        }
-        if (is_invalidate) {
-            inode->in_invalidate_list = true;
-            inode->table->invalidate_size++;
-            list_move_tail(&inode->list, &inode->table->invalidate);
-        } else {
-            __inode_activate(inode);
-        }
-    }
-
     inode->ref++;
 
     index = __inode_get_xl_index(inode, this);
@@ -587,42 +647,112 @@ __inode_ref(inode_t *inode, bool is_invalidate)
     return inode;
 }
 
-inode_t *
-inode_unref(inode_t *inode)
+static inode_t *
+__inode_ref_locked(inode_t *inode)
 {
-    inode_table_t *table = NULL;
-
-    if (!inode)
-        return NULL;
-
-    table = inode->table;
-
-    pthread_mutex_lock(&table->lock);
+    LOCK(&inode->ref_lock);
     {
-        inode = __inode_unref(inode, false);
+        __inode_ref(inode);
     }
-    pthread_mutex_unlock(&table->lock);
-
-    inode_table_prune(table);
+    UNLOCK(&inode->ref_lock);
 
     return inode;
 }
 
 inode_t *
+inode_unref(inode_t *inode)
+{
+    inode_table_t *table = NULL;
+    gf_boolean_t try_prune = false;
+
+    if (!inode)
+        return NULL;
+
+    LOCK(&inode->ref_lock);
+    {
+        /* Once faced with ref=1 inode, we have a greate chance to purge it, but
+         * as we have to move it off 'active' list, inode table lock is needed.
+         * We try next round with that lock obtained. This should not happen
+         * frequently. Futhermore, we add a statistics debug info about it. */
+        if (inode->ref == 1)
+            try_prune = true;
+        else
+            inode = __inode_unref(inode);
+    }
+    UNLOCK(&inode->ref_lock);
+
+    if (try_prune) {
+        table = inode->table;
+        pthread_rwlock_wrlock(&table->lock);
+        {
+            LOCK(&inode->ref_lock);
+            {
+                __inode_unref(inode);
+                if (inode->ref == 0) {
+                    __prune_inode(inode);
+                }
+            }
+            UNLOCK(&inode->ref_lock);
+        }
+        pthread_rwlock_unlock(&table->lock);
+
+        inode_table_prune(table);
+    }
+
+    return inode;
+}
+
+/* TODO: At brick side, it's not necessary to take 'nlookup' into account. That
+ * will simplify ref/unref logic very much! */
+inode_t *
 inode_ref(inode_t *inode)
 {
     inode_table_t *table = NULL;
+    int try_reuse = 0;
 
     if (!inode)
         return NULL;
 
     table = inode->table;
 
-    pthread_mutex_lock(&table->lock);
+    /* If an inode is on the 'invalidate' list, it can't be found by Gluster(not
+     * reference from kernel). So we don't have to worry much about the case
+     * that an inode is on 'invalidate' list with ref=1 and someone wants to ref
+     * it. Perhaps, add a ASSERT below.
+     */
+
+    LOCK(&inode->ref_lock);
     {
-        inode = __inode_ref(inode, false);
+        if (inode->ref == 0)
+            try_reuse = 1;
+        else
+            inode = __inode_ref(inode);
     }
-    pthread_mutex_unlock(&table->lock);
+    UNLOCK(&inode->ref_lock);
+
+    /* Incrementing inode ref whose current value is ZERO means we tends to
+     * use an inode on *LRU* list, which means we don't want to forget it from
+     * kernel or prune it anymore. For performance and concurrency sake, we
+     * check again whether the inode's ref is still ZERO If it is, remove it
+     * back to active list and reuse it. Otherwise, it is already reused from
+     * other code path. In most cases, we shouldn't walk into below code branch.
+     */
+    if (try_reuse) {
+        pthread_rwlock_wrlock(&table->lock);
+        {
+            LOCK(&inode->ref_lock);
+            {
+                if (inode->ref == 0) {
+                    __inode_ref(inode);
+                    __reuse_inode(inode);
+                } else {
+                    __inode_ref(inode);
+                }
+            }
+            UNLOCK(&inode->ref_lock);
+        }
+        pthread_rwlock_unlock(&table->lock);
+    }
 
     return inode;
 }
@@ -666,6 +796,7 @@ inode_create(inode_table_t *table)
     newi->table = table;
 
     LOCK_INIT(&newi->lock);
+    LOCK_INIT(&newi->ref_lock);
 
     INIT_LIST_HEAD(&newi->fd_list);
     INIT_LIST_HEAD(&newi->list);
@@ -700,13 +831,14 @@ inode_new(inode_table_t *table)
 
     inode = inode_create(table);
     if (inode) {
-        pthread_mutex_lock(&table->lock);
+        /* Add inode to lru list before ref is a trick and implicit so directly
+         * activate it with ref increased */
+        pthread_rwlock_wrlock(&table->lock);
         {
-            list_add(&inode->list, &table->lru);
-            table->lru_size++;
-            __inode_ref(inode, false);
+            __inode_ref_locked(inode);
+            __inode_activate(inode);
         }
-        pthread_mutex_unlock(&table->lock);
+        pthread_rwlock_unlock(&table->lock);
     }
 
     return inode;
@@ -724,8 +856,6 @@ inode_new(inode_table_t *table)
 static inode_t *
 __inode_ref_reduce_by_n(inode_t *inode, uint64_t nref)
 {
-    uint64_t nlookup = 0;
-
     GF_ASSERT(inode->ref >= nref);
 
     inode->ref -= nref;
@@ -733,15 +863,8 @@ __inode_ref_reduce_by_n(inode_t *inode, uint64_t nref)
     if (!nref)
         inode->ref = 0;
 
-    if (!inode->ref) {
-        inode->table->active_size--;
-
-        nlookup = GF_ATOMIC_GET(inode->nlookup);
-        if (nlookup)
-            __inode_passivate(inode);
-        else
-            __inode_retire(inode);
-    }
+    if (!inode->ref)
+        __prune_inode(inode);
 
     return inode;
 }
@@ -749,16 +872,15 @@ __inode_ref_reduce_by_n(inode_t *inode, uint64_t nref)
 static inode_t *
 inode_forget_atomic(inode_t *inode, uint64_t nlookup)
 {
-    uint64_t inode_lookup = 0;
-
     if (!inode)
         return NULL;
 
     if (nlookup == 0) {
         GF_ATOMIC_INIT(inode->nlookup, 0);
     } else {
-        inode_lookup = GF_ATOMIC_FETCH_SUB(inode->nlookup, nlookup);
-        GF_ASSERT(inode_lookup >= nlookup);
+        uint64_t i_nlookup = 0;
+        i_nlookup = GF_ATOMIC_FETCH_SUB(inode->nlookup, nlookup);
+        GF_ASSERT(i_nlookup >= nlookup);
     }
 
     return inode;
@@ -787,6 +909,7 @@ inode_grep(inode_table_t *table, inode_t *parent, const char *name)
 {
     inode_t *inode = NULL;
     dentry_t *dentry = NULL;
+    gf_boolean_t wrlock = false;
 
     if (!table || !parent || !name) {
         gf_msg_callingfn(THIS->name, GF_LOG_WARNING, EINVAL, LG_MSG_INVALID_ARG,
@@ -797,16 +920,41 @@ inode_grep(inode_table_t *table, inode_t *parent, const char *name)
 
     int hash = hash_dentry(parent, name, table->hashsize);
 
-    pthread_mutex_lock(&table->lock);
+again:
+    if (!wrlock)
+        pthread_rwlock_rdlock(&table->lock);
+    else
+        pthread_rwlock_wrlock(&table->lock);
     {
         dentry = __dentry_grep(table, parent, name, hash);
         if (dentry) {
             inode = dentry->inode;
-            if (inode)
-                __inode_ref(inode, false);
+            if (inode) {
+                /* As dentry is unhased only when its linked inode getting
+                 * retired. We can hardly find an inode whose ref is zero!
+                 * TODO: Considering above, double check makes no sense.
+                 * But still need add some debug code to prove it. */
+                LOCK(&inode->ref_lock);
+                {
+                    if (inode->ref != 0) {
+                        __inode_ref(inode);
+                    } else {
+                        if (!wrlock) {
+                            wrlock = true;
+                            UNLOCK(&inode->ref_lock);
+                            pthread_rwlock_unlock(&table->lock);
+                            goto again;
+                        } else {
+                            __inode_ref(inode);
+                            __reuse_inode(inode);
+                        }
+                    }
+                }
+                UNLOCK(&inode->ref_lock);
+            }
         }
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     return inode;
 }
@@ -873,7 +1021,7 @@ inode_grep_for_gfid(inode_table_t *table, inode_t *parent, const char *name,
 
     int hash = hash_dentry(parent, name, table->hashsize);
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_rdlock(&table->lock);
     {
         dentry = __dentry_grep(table, parent, name, hash);
         if (dentry) {
@@ -885,7 +1033,7 @@ inode_grep_for_gfid(inode_table_t *table, inode_t *parent, const char *name,
             }
         }
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     return ret;
 }
@@ -926,6 +1074,7 @@ inode_t *
 inode_find(inode_table_t *table, uuid_t gfid)
 {
     inode_t *inode = NULL;
+    gf_boolean_t wrlock = false;
 
     if (!table) {
         gf_msg_callingfn(THIS->name, GF_LOG_WARNING, 0,
@@ -937,13 +1086,46 @@ inode_find(inode_table_t *table, uuid_t gfid)
 
     int hash = hash_gfid(gfid, 65536);
 
-    pthread_mutex_lock(&table->lock);
+    /* TODO: Need to be discussed! Maybe, we can use another lock to protect
+     * table seaching and list changing
+     */
+again:
+    if (!wrlock)
+        pthread_rwlock_rdlock(&table->lock);
+    else
+        pthread_rwlock_wrlock(&table->lock);
     {
         inode = __inode_find(table, gfid, hash);
-        if (inode)
-            __inode_ref(inode, false);
+        if (inode) {
+            LOCK(&inode->ref_lock);
+            {
+                if (inode->ref != 0) {
+                    __inode_ref(inode);
+                } else {
+                    /* Perhaps, we can add 'reuse' statistics debug info here,
+                     * as I think there should not be many cases we hit it but
+                     * this branch can truly be walked into as inode is not
+                     * referenced when it's inserted to hash table.
+                     * TODO: Perhaps we can increase inode ref when hashing it.
+                     * Then we don't have to double check. Then we have to set
+                     * up a principle defining an unused inode which should be
+                     * put to purge list and unhased.
+                     */
+                    if (!wrlock) {
+                        wrlock = true;
+                        UNLOCK(&inode->ref_lock);
+                        pthread_rwlock_unlock(&table->lock);
+                        goto again;
+                    } else {
+                        __inode_ref(inode);
+                        __reuse_inode(inode);
+                    }
+                }
+            }
+            UNLOCK(&inode->ref_lock);
+        }
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     return inode;
 }
@@ -1041,7 +1223,7 @@ __inode_link(inode_t *inode, inode_t *parent, const char *name,
             }
 
             /* dentry linking needs to happen inside lock */
-            dentry->parent = __inode_ref(parent, false);
+            dentry->parent = __inode_ref_locked(parent);
             list_add(&dentry->inode_list, &link_inode->dentry_list);
 
             if (old_inode && __is_dentry_cyclic(dentry)) {
@@ -1083,13 +1265,23 @@ inode_link(inode_t *inode, inode_t *parent, const char *name, struct iatt *iatt)
         return NULL;
     }
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_wrlock(&table->lock);
     {
         linked_inode = __inode_link(inode, parent, name, iatt, hash);
-        if (linked_inode)
-            __inode_ref(linked_inode, false);
+        if (linked_inode) {
+            LOCK(&linked_inode->ref_lock);
+            {
+                if (linked_inode->ref == 0) {
+                    __inode_ref(linked_inode);
+                    __reuse_inode(linked_inode);
+                } else {
+                    __inode_ref(linked_inode);
+                }
+            }
+            UNLOCK(&linked_inode->ref_lock);
+        }
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     inode_table_prune(table);
 
@@ -1123,11 +1315,15 @@ inode_ref_reduce_by_n(inode_t *inode, uint64_t nref)
 
     table = inode->table;
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_wrlock(&table->lock);
     {
-        __inode_ref_reduce_by_n(inode, nref);
+        LOCK(&inode->ref_lock);
+        {
+            __inode_ref_reduce_by_n(inode, nref);
+        }
+        UNLOCK(&inode->ref_lock);
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     inode_table_prune(table);
 
@@ -1167,13 +1363,8 @@ inode_forget_with_unref(inode_t *inode, uint64_t nlookup)
 
     table = inode->table;
 
-    pthread_mutex_lock(&table->lock);
-    {
-        inode_forget_atomic(inode, nlookup);
-        __inode_unref(inode, true);
-    }
-    pthread_mutex_unlock(&table->lock);
-
+    inode_forget_atomic(inode, nlookup);
+    inode_unref(inode);
     inode_table_prune(table);
 
     return 0;
@@ -1261,11 +1452,17 @@ inode_unlink(inode_t *inode, inode_t *parent, const char *name)
 
     table = inode->table;
 
-    pthread_mutex_lock(&table->lock);
+    /* TODO: We have to use table lock here since this inode's dentries might
+     * need to be destroyed.
+     * From Xavi: we could place dentry name hash table to parent inode thus no
+     * need for table lock anymore. Or we can add a new lock to protect hashing
+     * to get rid of table lock.
+     */
+    pthread_rwlock_wrlock(&table->lock);
     {
         dentry = __inode_unlink(inode, parent, name);
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     dentry_destroy(dentry);
 
@@ -1297,13 +1494,13 @@ inode_rename(inode_table_t *table, inode_t *srcdir, const char *srcname,
         hash = hash_dentry(dstdir, dstname, table->hashsize);
     }
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_wrlock(&table->lock);
     {
         __inode_link(inode, dstdir, dstname, iatt, hash);
         /* pick the old dentry */
         dentry = __inode_unlink(inode, srcdir, srcname);
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     /* free the old dentry */
     dentry_destroy(dentry);
@@ -1347,6 +1544,7 @@ inode_parent(inode_t *inode, uuid_t pargfid, const char *name)
     inode_t *parent = NULL;
     inode_table_t *table = NULL;
     dentry_t *dentry = NULL;
+    gf_boolean_t wrlock = false;
 
     if (!inode) {
         gf_msg_callingfn(THIS->name, GF_LOG_WARNING, 0, LG_MSG_INODE_NOT_FOUND,
@@ -1356,7 +1554,14 @@ inode_parent(inode_t *inode, uuid_t pargfid, const char *name)
 
     table = inode->table;
 
-    pthread_mutex_lock(&table->lock);
+    /* Current function is called from several places especially from quota part
+     * Firstly, we use RDLOCK to protect
+     */
+again:
+    if (!wrlock)
+        pthread_rwlock_rdlock(&table->lock);
+    else
+        pthread_rwlock_wrlock(&table->lock);
     {
         if (pargfid && !gf_uuid_is_null(pargfid) && name) {
             dentry = __dentry_search_for_inode(inode, pargfid, name);
@@ -1367,10 +1572,30 @@ inode_parent(inode_t *inode, uuid_t pargfid, const char *name)
         if (dentry)
             parent = dentry->parent;
 
-        if (parent)
-            __inode_ref(parent, false);
+        if (parent) {
+            LOCK(&parent->ref_lock);
+            {
+                /* Actually, I think finding a parent inode with ref=0 can
+                 * hardly happen, but still need some infrastructure to prove it
+                 */
+                if (parent->ref != 0) {
+                    __inode_ref(parent);
+                } else {
+                    if (!wrlock) {
+                        wrlock = true;
+                        UNLOCK(&parent->ref_lock);
+                        pthread_rwlock_unlock(&table->lock);
+                        goto again;
+                    } else {
+                        __inode_ref(parent);
+                        __reuse_inode(parent);
+                    }
+                }
+            }
+            UNLOCK(&parent->ref_lock);
+        }
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     return parent;
 }
@@ -1510,11 +1735,11 @@ inode_path(inode_t *inode, const char *name, char **bufp)
 
     table = inode->table;
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_rdlock(&table->lock);
     {
         ret = __inode_path(inode, name, bufp);
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     return ret;
 }
@@ -1529,11 +1754,11 @@ __inode_table_set_lru_limit(inode_table_t *table, uint32_t lru_limit)
 void
 inode_table_set_lru_limit(inode_table_t *table, uint32_t lru_limit)
 {
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_wrlock(&table->lock);
     {
         __inode_table_set_lru_limit(table, lru_limit);
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     inode_table_prune(table);
 
@@ -1559,7 +1784,7 @@ inode_table_prune(inode_table_t *table)
 
     INIT_LIST_HEAD(&purge);
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_wrlock(&table->lock);
     {
         if (!table->lru_limit)
             goto purge_list;
@@ -1587,7 +1812,21 @@ inode_table_prune(inode_table_t *table)
                         list_move_tail(&entry->list, &table->lru);
                         continue;
                     }
-                    __inode_ref(entry, true);
+
+                    /* Generally, inode with ref=0 is put onto lru list. If its
+                     * nlookup is still not zero while lru list is too long. We
+                     * have to invalidate it. Only when both nlookup and ref are
+                     * zero, we can retire it by putting it onto purge list.*/
+
+                    GF_ASSERT(entry->ref == 0);
+
+                    /* As we are moving inode off from lru list, increase its
+                     * ref. */
+                    __inode_ref_locked(entry);
+                    entry->in_invalidate_list = true;
+                    entry->table->invalidate_size++;
+                    list_move_tail(&entry->list, &entry->table->invalidate);
+
                     tmp = entry;
                     break;
                 }
@@ -1602,7 +1841,7 @@ inode_table_prune(inode_table_t *table)
         list_splice_init(&table->purge, &purge);
         table->purge_size = 0;
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     /* Pick 1 inode for invalidation */
     if (tmp) {
@@ -1610,17 +1849,15 @@ inode_table_prune(inode_table_t *table)
         THIS = table->invalidator_xl;
         ret1 = table->invalidator_fn(table->invalidator_xl, tmp);
         THIS = old_THIS;
-        pthread_mutex_lock(&table->lock);
-        {
-            if (!ret1) {
-                tmp->invalidate_sent = true;
-                __inode_unref(tmp, false);
-            } else {
-                /* Move this back to the lru list*/
-                __inode_unref(tmp, true);
-            }
+
+        /* To be discussed: No matter 'invalidation req' succeeds or fails, we
+         * should return inode back to lru list, thus to have a chance to get it
+         * retired? */
+        if (!ret1) {
+            tmp->invalidate_sent = true;
         }
-        pthread_mutex_unlock(&table->lock);
+
+        inode_unref(tmp);
     }
 
     /* Just so that if purge list is handled too, then clear it off */
@@ -1733,7 +1970,9 @@ inode_table_with_invalidator(uint32_t lru_limit, xlator_t *xl,
 
     __inode_table_init_root(new);
 
-    pthread_mutex_init(&new->lock, NULL);
+    pthread_rwlock_init(&new->lock, NULL);
+
+    GF_ATOMIC_INIT(new->active_size, 0);
 
     ret = 0;
 out:
@@ -1771,13 +2010,14 @@ inode_table_ctx_free(inode_table_t *table)
     int active_count = 0;
     xlator_t *this = NULL;
     int itable_size = 0;
+    int active_size = 0;
 
     if (!table)
         return -1;
 
     this = THIS;
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_wrlock(&table->lock);
     {
         list_for_each_entry_safe(del, tmp, &table->purge, list)
         {
@@ -1809,18 +2049,20 @@ inode_table_ctx_free(inode_table_t *table)
             }
         }
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     ret = purge_count + lru_count + active_count;
-    itable_size = table->active_size + table->lru_size + table->purge_size;
+
+    active_size = GF_ATOMIC_GET(table->active_size);
+    itable_size = active_size + table->lru_size + table->purge_size;
+
     gf_msg_callingfn(this->name, GF_LOG_INFO, 0, LG_MSG_INODE_CONTEXT_FREED,
                      "total %d (itable size: "
                      "%d) inode contexts have been freed (active: %d, ("
                      "active size: %d), lru: %d, (lru size: %d),  purge: "
                      "%d, (purge size: %d))",
-                     ret, itable_size, active_count, table->active_size,
-                     lru_count, table->lru_size, purge_count,
-                     table->purge_size);
+                     ret, itable_size, active_count, active_size, lru_count,
+                     table->lru_size, purge_count, table->purge_size);
     return ret;
 }
 
@@ -1879,7 +2121,7 @@ inode_table_destroy(inode_table_t *inode_table)
     /* Approach 3:
      * ret = inode_table_ctx_free (inode_table);
      */
-    pthread_mutex_lock(&inode_table->lock);
+    pthread_rwlock_wrlock(&inode_table->lock);
     {
         inode_table->cleanup_started = _gf_true;
         /* Process lru list first as we need to unset their dentry
@@ -1920,10 +2162,14 @@ inode_table_destroy(inode_table_t *inode_table)
                                  "(%d) found during cleanup",
                                  trav, trav->ref);
             inode_forget_atomic(trav, 0);
-            __inode_ref_reduce_by_n(trav, 0);
+            LOCK(&trav->ref_lock);
+            {
+                __inode_ref_reduce_by_n(trav, 0);
+            }
+            UNLOCK(&trav->ref_lock);
         }
     }
-    pthread_mutex_unlock(&inode_table->lock);
+    pthread_rwlock_unlock(&inode_table->lock);
 
     inode_table_prune(inode_table);
 
@@ -1936,7 +2182,7 @@ inode_table_destroy(inode_table_t *inode_table)
     if (inode_table->fd_mem_pool)
         mem_pool_destroy(inode_table->fd_mem_pool);
 
-    pthread_mutex_destroy(&inode_table->lock);
+    pthread_rwlock_destroy(&inode_table->lock);
 
     GF_FREE(inode_table->name);
     GF_FREE(inode_table);
@@ -2377,11 +2623,11 @@ inode_is_linked(inode_t *inode)
 
     table = inode->table;
 
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_rdlock(&table->lock);
     {
         ret = __is_inode_hashed(inode);
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
 
     return ret;
 }
@@ -2471,8 +2717,10 @@ inode_table_dump(inode_table_t *itable, char *prefix)
     if (!itable)
         return;
 
-    ret = pthread_mutex_trylock(&itable->lock);
-
+    /* When running regression test, it's likely to fail in obtaining this lock,
+     * so I convert it ro non-trial version.
+     */
+    ret = pthread_rwlock_rdlock(&itable->lock);
     if (ret != 0) {
         return;
     }
@@ -2485,7 +2733,7 @@ inode_table_dump(inode_table_t *itable, char *prefix)
     gf_proc_dump_build_key(key, prefix, "lru_limit");
     gf_proc_dump_write(key, "%d", itable->lru_limit);
     gf_proc_dump_build_key(key, prefix, "active_size");
-    gf_proc_dump_write(key, "%d", itable->active_size);
+    gf_proc_dump_write(key, "%d", GF_ATOMIC_GET(itable->active_size));
     gf_proc_dump_build_key(key, prefix, "lru_size");
     gf_proc_dump_write(key, "%d", itable->lru_size);
     gf_proc_dump_build_key(key, prefix, "purge_size");
@@ -2498,7 +2746,7 @@ inode_table_dump(inode_table_t *itable, char *prefix)
     INODE_DUMP_LIST(&itable->purge, key, prefix, "purge");
     INODE_DUMP_LIST(&itable->invalidate, key, prefix, "invalidate");
 
-    pthread_mutex_unlock(&itable->lock);
+    pthread_rwlock_unlock(&itable->lock);
 }
 
 void
@@ -2551,7 +2799,7 @@ inode_table_dump_to_dict(inode_table_t *itable, char *prefix, dict_t *dict)
     inode_t *inode = NULL;
     int count = 0;
 #endif
-    ret = pthread_mutex_trylock(&itable->lock);
+    ret = pthread_rwlock_tryrdlock(&itable->lock);
     if (ret)
         return;
 
@@ -2561,7 +2809,7 @@ inode_table_dump_to_dict(inode_table_t *itable, char *prefix, dict_t *dict)
         goto out;
 
     snprintf(key, sizeof(key), "%s.itable.active_size", prefix);
-    ret = dict_set_uint32(dict, key, itable->active_size);
+    ret = dict_set_uint32(dict, key, GF_ATOMIC_GET(itable->active_size));
     if (ret)
         goto out;
 
@@ -2604,7 +2852,7 @@ inode_table_dump_to_dict(inode_table_t *itable, char *prefix, dict_t *dict)
 #endif
 
 out:
-    pthread_mutex_unlock(&itable->lock);
+    pthread_rwlock_unlock(&itable->lock);
 
     return;
 }
@@ -2667,14 +2915,14 @@ inode_find_directory_name(inode_t *inode, const char **name)
     if (!IA_ISDIR(inode->ia_type))
         return;
 
-    pthread_mutex_lock(&inode->table->lock);
+    pthread_rwlock_rdlock(&inode->table->lock);
     {
         dentry = __dentry_search_arbit(inode);
         if (dentry) {
             *name = dentry->name;
         }
     }
-    pthread_mutex_unlock(&inode->table->lock);
+    pthread_rwlock_unlock(&inode->table->lock);
 out:
     return;
 }

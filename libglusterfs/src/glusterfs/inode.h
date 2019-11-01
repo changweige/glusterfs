@@ -34,7 +34,7 @@ typedef struct _dentry dentry_t;
 #include "glusterfs/fd.h"
 
 struct _inode_table {
-    pthread_mutex_t lock;
+    pthread_rwlock_t lock;
     size_t hashsize;    /* bucket size of inode hash and dentry hash */
     char *name;         /* name of the inode table, just for gf_log() */
     inode_t *root;      /* root directory inode, with number 1 */
@@ -43,12 +43,12 @@ struct _inode_table {
     struct list_head *inode_hash; /* buckets for inode hash table */
     struct list_head *name_hash;  /* buckets for dentry hash table */
     struct list_head active; /* list of inodes currently active (in an fop) */
-    uint32_t active_size;    /* count of inodes in active list */
-    struct list_head lru;    /* list of inodes recently used.
-                                lru.next most recent */
-    uint32_t lru_size;       /* count of inodes in lru list  */
-    struct list_head purge;  /* list of inodes to be purged soon */
-    uint32_t purge_size;     /* count of inodes in purge list */
+    gf_atomic_int32_t active_size; /* count of inodes in active list */
+    struct list_head lru;          /* list of inodes recently used.
+                                      lru.next most recent */
+    uint32_t lru_size;             /* count of inodes in lru list  */
+    struct list_head purge;        /* list of inodes to be purged soon */
+    uint32_t purge_size;           /* count of inodes in purge list */
 
     struct mem_pool *inode_pool;  /* memory pool for inodes */
     struct mem_pool *dentry_pool; /* memory pool for dentrys */
@@ -100,6 +100,7 @@ struct _inode {
     inode_table_t *table; /* the table this inode belongs to */
     uuid_t gfid;
     gf_lock_t lock;
+    gf_lock_t ref_lock;
     gf_atomic_t nlookup;
     uint32_t fd_count;            /* Open fd count */
     uint32_t active_fd_count;     /* Active open fd count */
